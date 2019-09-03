@@ -7,6 +7,13 @@ of the utils below at https://github.com/Justin1904/tetheras-utils.
 Preprocessing multimodal data is really tiring...
 '''
 from __future__ import print_function
+from constants import SDK_PATH
+import sys
+if SDK_PATH is None:
+    print("SDK path is not specified! Please specify first in constants/paths.py")
+    exit(0)
+else:
+    sys.path.append(SDK_PATH)
 import mmdata
 import numpy as np
 from torch.utils.data import Dataset
