@@ -6,140 +6,194 @@ There's a packaged (and more up-to-date) version
 of the utils below at https://github.com/Justin1904/tetheras-utils.
 Preprocessing multimodal data is really tiring...
 '''
-from __future__ import print_function
-import mmdata
+from constants import SDK_PATH, DATA_PATH, WORD_EMB_PATH, CACHE_PATH
+import sys
+
+if SDK_PATH is None:
+    print("SDK path is not specified! Please specify first in constants/paths.py")
+    exit(0)
+else:
+    sys.path.append(SDK_PATH)
+import mmsdk
+import os
+import re
 import numpy as np
-from torch.utils.data import Dataset
-
-def pad(data, max_len):
-    """Pads data without time stamps"""
-    data = remove_timestamps(data)
-    n_rows = data.shape[0]
-    dim = data.shape[1]
-    if max_len >= n_rows:
-        diff = max_len - n_rows
-        padding = np.zeros((diff, dim))
-        padded = np.concatenate((padding, data))
-        return padded
-    else:
-        return data[-max_len:]
-
-def remove_timestamps(segment_data):
-    """Removes the start and end time stamps in the Multimodal Data SDK"""
-    return np.array([feature[2] for feature in segment_data])
-
-class ProcessedDataset(Dataset):
-    """The class object for processed data, pipelined from CMU-MultimodalDataSDK through MultimodalDataset"""
-    def __init__(self, audio, visual, text, labels):
-        self.audio = audio
-        self.visual = visual
-        self.text = text
-        self.labels = labels
-
-    def __len__(self):
-        """Checks the number of data points are the same across different modalities, and return length"""
-        assert self.audio.shape[1] == self.visual.shape[1] and self.visual.shape[1] == self.text.shape[1] and self.text.shape[1] == self.labels.shape[0]
-        return self.audio.shape[1]
-
-    def __getitem__(self, idx):
-        """Returns the target element by index"""
-        return [self.audio[:, idx, :], self.visual[:, idx, :], self.text[:, idx, :], self.labels[idx]]
+from mmsdk import mmdatasdk as md
+from subprocess import check_call, CalledProcessError
+import torch
+import torch.nn as nn
+from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
+from torch.utils.data import DataLoader, Dataset
+from collections import defaultdict
 
 
-class MultimodalDataset(object):
-    """The class object for all multimodal datasets from CMU-MultimodalDataSDK"""
-    def __init__(self, dataset, visual='facet', audio='covarep', text='embeddings', pivot='words', sentiments=True, emotions=False, max_len=20):
-        # instantiate a multimodal dataloader
-        self.dataloader = mmdata.__dict__[dataset]()
-        self.max_len = max_len
+def download():
+    # create folders for storing the data
+    if not os.path.exists(DATA_PATH):
+        check_call(' '.join(['mkdir', '-p', DATA_PATH]), shell=True)
 
-        # load the separate modalities, it's silly to access parent class' methods
-        self.visual = self.dataloader.__class__.__bases__[0].__dict__[visual](self.dataloader)
-        self.audio = self.dataloader.__class__.__bases__[0].__dict__[audio](self.dataloader)
-        self.text = self.dataloader.__class__.__bases__[0].__dict__[text](self.dataloader)
-        # self.pivot = self.dataloader.__class__.__bases__[0].__dict__[pivot](self.dataloader)
+    # download highlevel features, low-level (raw) data and labels for the dataset MOSI
+    # if the files are already present, instead of downloading it you just load it yourself.
+    # here we use CMU_MOSI dataset as example.
 
-        # load train/dev/test splits and labels
-        self.train_vids = self.dataloader.train()
-        self.valid_vids = self.dataloader.valid()
-        self.test_vids = self.dataloader.test()
-        if sentiments:
-            self.sentiments = self.dataloader.sentiments()
-        if emotions:
-            self.emotions = self.dataloader.emotions()
+    DATASET = md.cmu_mosi
 
-        # merge them one by one
-        self.dataset = mmdata.Dataset.merge(self.visual, self.text)
-        self.dataset = mmdata.Dataset.merge(self.audio, self.dataset)
+    try:
+        md.mmdataset(DATASET.highlevel, DATA_PATH)
+    except RuntimeError:
+        print("High-level features have been downloaded previously.")
 
-        # align the modalities
-        self.aligned = self.dataset.align(text)
+    try:
+        md.mmdataset(DATASET.raw, DATA_PATH)
+    except RuntimeError:
+        print("Raw data have been downloaded previously.")
         
-        # split the training, validation and test sets and preprocess them
-        train_set_ids = []
-        for vid in self.train_vids:
-            for sid in self.dataset[text][vid].keys():
-                if self.triple_check(vid, sid, audio, visual, text):
-                    train_set_ids.append((vid, sid))
+    try:
+        md.mmdataset(DATASET.labels, DATA_PATH)
+    except RuntimeError:
+        print("Labels have been downloaded previously.")
+    
+    return DATASET
+    
+def load(visual_field, acoustic_field, text_field):
+    features = [
+        text_field, 
+        visual_field, 
+        acoustic_field
+    ]
+    recipe = {feat: os.path.join(DATA_PATH, feat) + '.csd' for feat in features}
+    dataset = md.mmdataset(recipe)
 
-        valid_set_ids = []
-        for vid in self.valid_vids:
-            for sid in self.dataset[text][vid].keys():
-                if self.triple_check(vid, sid, audio, visual, text):
-                    valid_set_ids.append((vid, sid))
+    return dataset
 
-        test_set_ids = []
-        for vid in self.test_vids:
-            for sid in self.dataset[text][vid].keys():
-                if self.triple_check(vid, sid, audio, visual, text):
-                    test_set_ids.append((vid, sid))
+def align(text_field, dataset):
+    # we define a simple averaging function that does not depend on intervals
+    def avg(intervals: np.array, features: np.array) -> np.array:
+        try:
+            return np.average(features, axis=0)
+        except:
+            return features
 
-        self.train_set_audio = np.stack([pad(self.aligned[audio][vid][sid], self.max_len) for (vid, sid) in train_set_ids if self.aligned[audio][vid][sid]], axis=1)
-        self.valid_set_audio = np.stack([pad(self.aligned[audio][vid][sid], self.max_len) for (vid, sid) in valid_set_ids if self.aligned[audio][vid][sid]], axis=1)
-        self.test_set_audio = np.stack([pad(self.aligned[audio][vid][sid], self.max_len) for (vid, sid) in test_set_ids if self.aligned[audio][vid][sid]], axis=1)
+    # first we align to words with averaging, collapse_function receives a list of functions
+    dataset.align(text_field, collapse_functions=[avg])
 
-        self.train_set_audio = self.validify(self.train_set_audio)
-        self.valid_set_audio = self.validify(self.valid_set_audio)
-        self.test_set_audio = self.validify(self.test_set_audio)
+def annotate(dataset, label_field):
 
-        self.train_set_visual = np.stack([pad(self.aligned[visual][vid][sid], self.max_len) for (vid, sid) in train_set_ids], axis=1)
-        self.valid_set_visual = np.stack([pad(self.aligned[visual][vid][sid], self.max_len) for (vid, sid) in valid_set_ids], axis=1)
-        self.test_set_visual = np.stack([pad(self.aligned[visual][vid][sid], self.max_len) for (vid, sid) in test_set_ids], axis=1)
+    # we add and align to lables to obtain labeled segments
+    # this time we don't apply collapse functions so that the temporal sequences are preserved
+    label_recipe = {label_field: os.path.join(DATA_PATH, label_field + '.csd')}
+    dataset.add_computational_sequences(label_recipe, destination=None)
+    dataset.align(label_field)
 
-        self.train_set_visual = self.validify(self.train_set_visual)
-        self.valid_set_visual = self.validify(self.valid_set_visual)
-        self.test_set_visual = self.validify(self.test_set_visual)
+def get_splits(DATASET):
+    # not a random selection, but predefined in the CMU_MOSI files
+    train_split = DATASET.standard_folds.standard_train_fold
+    # validation split called dev_split for some reason
+    dev_split = DATASET.standard_folds.standard_valid_fold
+    test_split = DATASET.standard_folds.standard_test_fold
+    return train_split, dev_split, test_split
 
-        self.train_set_text = np.stack([pad(self.aligned[text][vid][sid], self.max_len) for (vid, sid) in train_set_ids], axis=1)
-        self.valid_set_text = np.stack([pad(self.aligned[text][vid][sid], self.max_len) for (vid, sid) in valid_set_ids], axis=1)
-        self.test_set_text = np.stack([pad(self.aligned[text][vid][sid], self.max_len) for (vid, sid) in test_set_ids], axis=1)
+def split(splits, dataset, label_field, visual_field, acoustic_field, text_field):
+    # obtain the train/dev/test splits - these splits are based on video IDs
+    train_split, dev_split, test_split = splits
+    
+    # a sentinel epsilon for safe division, without it we will replace illegal values with a constant
+    EPS = 0
 
-        self.train_set_text = self.validify(self.train_set_text)
-        self.valid_set_text = self.validify(self.valid_set_text)
-        self.test_set_text = self.validify(self.test_set_text)
+    # construct a word2id mapping that automatically takes increment when new words are encountered
+    word2id = defaultdict(lambda: len(word2id))
+    # hence, word2id['<unk>'] == 0
+    UNK = word2id['<unk>']
+    # and, word2id['<pad>'] == 1
+    word2id['<pad>']
 
-        self.train_set_labels = np.array([self.sentiments[vid][sid] for (vid, sid) in train_set_ids])
-        self.valid_set_labels = np.array([self.sentiments[vid][sid] for (vid, sid) in valid_set_ids])
-        self.test_set_labels = np.array([self.sentiments[vid][sid] for (vid, sid) in test_set_ids])
+    # place holders for the final train/dev/test dataset
+    train = []
+    dev = []
+    test = []
 
-        self.train_set_labels = self.validify(self.train_set_labels)
-        self.valid_set_labels = self.validify(self.valid_set_labels)
-        self.test_set_labels = self.validify(self.test_set_labels)
+    # define a regular expression to extract the video ID out of the keys
+    pattern = re.compile('(.*)\[.*\]') # should probably change * to +
+    num_drop = 0 # a counter to count how many data points went into some processing issues
 
-        self.train_set = ProcessedDataset(self.train_set_audio, self.train_set_visual, self.train_set_text, self.train_set_labels)
-        self.valid_set = ProcessedDataset(self.valid_set_audio, self.valid_set_visual, self.valid_set_text, self.valid_set_labels)
-        self.test_set = ProcessedDataset(self.test_set_audio, self.test_set_visual, self.test_set_text, self.test_set_labels)
+    for segment in dataset[label_field].keys():
+        
+        # get the video ID and the features out of the aligned dataset
+        vid = re.search(pattern, segment).group(1)
+        label = dataset[label_field][segment]['features'] #
+        _words = dataset[text_field][segment]['features'] #
+        _visual = dataset[visual_field][segment]['features'] #
+        _acoustic = dataset[acoustic_field][segment]['features'] #
 
-    def triple_check(self, vid, sid, audio, visual, text):
-        """Checks if this segment data is intact"""
-        if self.aligned[audio][vid][sid] and self.aligned[visual][vid][sid] and self.aligned[text][vid][sid]:
-            return True
+        # if the sequences are not same length after alignment, there must be some problem with some modalities
+        # we should drop it or inspect the data again
+        if not _words.shape[0] == _visual.shape[0] == _acoustic.shape[0]:
+            print(f"Encountered datapoint {vid} with text shape {_words.shape}, visual shape {_visual.shape}, acoustic shape {_acoustic.shape}")
+            num_drop += 1
+            continue
+
+        # remove nan values
+        label = np.nan_to_num(label)
+        _visual = np.nan_to_num(_visual)
+        _acoustic = np.nan_to_num(_acoustic)
+
+        # remove speech pause tokens - this is in general helpful
+        # we should remove speech pauses and corresponding visual/acoustic features together
+        # otherwise modalities would no longer be aligned
+        words = []
+        visual = []
+        acoustic = []
+        for i, word in enumerate(_words):
+            if word[0] != b'sp':
+                words.append(word2id[word[0].decode('utf-8')]) # SDK stores strings as bytes, decode into strings here
+                visual.append(_visual[i, :])
+                acoustic.append(_acoustic[i, :])
+
+        words = np.asarray(words) # list to np array
+        visual = np.asarray(visual)
+        acoustic = np.asarray(acoustic)
+
+        # z-normalization per instance and remove nan/infs (Replace NaN with zero and infinity with large finite numbers)
+        visual = np.nan_to_num((visual - visual.mean(0, keepdims=True)) / (EPS + np.std(visual, axis=0, keepdims=True)))
+        acoustic = np.nan_to_num((acoustic - acoustic.mean(0, keepdims=True)) / (EPS + np.std(acoustic, axis=0, keepdims=True)))
+
+        if vid in train_split:
+            train.append(((words, visual, acoustic), label, segment))
+        elif vid in dev_split:
+            dev.append(((words, visual, acoustic), label, segment))
+        elif vid in test_split:
+            test.append(((words, visual, acoustic), label, segment))
         else:
-            print("Video {} segment {} has incomplete data and has been discarded!".format(vid, sid))
-            return False
+            print(f"Found video that doesn't belong to any splits: {vid}")
 
-    def validify(self, array, dummy=0):
-        """Check and remove NaN values in the data!"""
-        array[array != array] = dummy
-        return array
+    print(f"Total number of {num_drop} datapoints have been dropped.")
 
+    # turn off the word2id - define a named function here to allow for pickling
+    def return_unk():
+        return UNK
+    word2id.default_factory = return_unk
+    return train, dev, test, word2id
+
+def create_data_loader(train, dev, test, word2id):
+    def multi_collate(batch):
+        '''
+        Collate functions assume batch = [Dataset[i] for i in index_set]
+        '''
+        # for later use we sort the batch in descending order of length
+        batch = sorted(batch, key=lambda x: x[0][0].shape[0], reverse=True)
+        
+        # get the data out of the batch - use pad sequence util functions from PyTorch to pad things
+        labels = torch.cat([torch.from_numpy(sample[1]) for sample in batch], dim=0)
+        sentences = pad_sequence([torch.LongTensor(sample[0][0]) for sample in batch], padding_value=word2id['<pad>'])
+        visual = pad_sequence([torch.FloatTensor(sample[0][1]) for sample in batch])
+        acoustic = pad_sequence([torch.FloatTensor(sample[0][2]) for sample in batch])
+        
+        # lengths are useful later in using RNNs
+        lengths = torch.LongTensor([sample[0][0].shape[0] for sample in batch])
+        return sentences, visual, acoustic, labels, lengths
+    # construct dataloaders, dev and test could use around ~X3 times batch size since no_grad is used during eval
+    batch_sz = 56
+    train_loader = DataLoader(train, shuffle=True, batch_size=batch_sz, collate_fn=multi_collate)
+    dev_loader = DataLoader(dev, shuffle=False, batch_size=batch_sz*3, collate_fn=multi_collate)
+    test_loader = DataLoader(test, shuffle=False, batch_size=batch_sz*3, collate_fn=multi_collate)
+    return train_loader, dev_loader, test_loader
