@@ -13,13 +13,14 @@ import numpy as np
 import utils
 import pickle # for debugging purposes
 
-
 def preprocess(options):
     # parse the input args
     dataset = options['dataset']
-    epochs = options['epochs']
     model_path = options['model_path']
-    max_len = options['max_len']
+    batch_size = options['batch_size']
+    DTYPE = torch.FloatTensor
+    if options['cuda']:
+        DTYPE = torch.cuda.FloatTensor
 
     # prepare the paths for storing models
     model_path = os.path.join(
@@ -27,7 +28,7 @@ def preprocess(options):
     print("Temp location for saving model: {}".format(model_path))
 
     # define fields
-    text_field = 'CMU_MOSI_ModifiedTimestampedWords'
+    text_field = 'CMU_MOSI_TimestampedWordVectors_1.1'
     visual_field = 'CMU_MOSI_VisualFacet_4.1'
     acoustic_field = 'CMU_MOSI_COVAREP'
     label_field = 'CMU_MOSI_Opinion_Labels'
@@ -50,17 +51,10 @@ def preprocess(options):
         f = open('./vars/dump', 'rb')
         splits, dataset = pickle.load(f)
         f.close()
-    train, dev, test, word2id = utils.split(splits, dataset, label_field, visual_field, acoustic_field, text_field)
-    some_id = list(dataset[text_field].keys())[0]
-    _, audio_dim = dataset[acoustic_field][some_id]['features'].shape
-    print("Audio feature dimension is: {}".format(audio_dim))
-    _, visual_dim = dataset[visual_field][some_id]['features'].shape
-    print("Visual feature dimension is: {}".format(visual_dim))
-    _, text_dim = dataset[text_field][some_id]['features'].shape
-    print("Text feature dimension is: {}".format(text_dim))
-    input_dims = (audio_dim, visual_dim, text_dim)
-    train_loader, dev_loader, test_loader = utils.create_data_loader(train, dev, test, word2id)
 
+    input_dims = utils.get_dims_from_dataset(dataset, text_field, acoustic_field, visual_field)
+    train, dev, test = utils.split(splits, dataset, label_field, visual_field, acoustic_field, text_field, batch_size)
+    train_loader, dev_loader, test_loader = utils.create_data_loader(train, dev, test, batch_size, DTYPE)
     return train_loader, dev_loader, test_loader, input_dims
 
 def display(test_loss, test_binacc, test_precision, test_recall, test_f1, test_septacc, test_corr):
@@ -73,13 +67,11 @@ def display(test_loss, test_binacc, test_precision, test_recall, test_f1, test_s
     print("Correlation w.r.t human evaluation on test set is {}".format(test_corr))
 
 def main(options):
-    DTYPE = torch.FloatTensor
     train_loader, valid_loader, test_loader, input_dims = preprocess(options)
 
     model = TFN(input_dims, (4, 16, 128), 64, (0.3, 0.3, 0.3, 0.3), 32)
     if options['cuda']:
         model = model.cuda()
-        DTYPE = torch.cuda.FloatTensor
     print("Model initialized")
     criterion = nn.L1Loss(size_average=False)
     optimizer = optim.Adam(list(model.parameters())[2:]) # don't optimize the first 2 params, they should be fixed (output_range and shift)
@@ -87,29 +79,22 @@ def main(options):
     # setup training
     complete = True
     min_valid_loss = float('Inf')
-    batch_sz = options['batch_size']
     patience = options['patience']
     epochs = options['epochs']
     model_path = options['model_path']
     curr_patience = patience
     for e in range(epochs):
         model.train()
-        model.zero_grad()
         train_loss = 0.0
+        num_processed = 0
         for batch in train_loader:
+            num_processed += batch[0].shape[0]
             model.zero_grad()
-
-            # the provided data has format [batch_size, seq_len, feature_dim] or [batch_size, 1, feature_dim]
-            #_a, _v, _t, _, _y = batch
-            _t, _v, _a, _y, _ = batch
-            a = Variable(_a.float().type(DTYPE), requires_grad=False).squeeze()
-            v = Variable(_v.float().type(DTYPE), requires_grad=False).squeeze()
-            t = Variable(_t.float().type(DTYPE), requires_grad=False)
-            y = Variable(_y.view(-1, 1).float().type(DTYPE), requires_grad=False)
+            t, v, a, y = batch
             output = model(a, v, t)
             loss = criterion(output, y)
             loss.backward()
-            train_loss += loss.data[0] / len(train_loader.dataset)
+            train_loss += loss.data.item() / len(train_loader.dataset)
             optimizer.step()
 
         print("Epoch {} complete! Average Training loss: {}".format(e, train_loss))
@@ -123,12 +108,8 @@ def main(options):
         # On validation set we don't have to compute metrics other than MAE and accuracy
         model.eval()
         for batch in valid_loader:
-            x = batch[:-1]
-            x_a = Variable(x[0].float().type(DTYPE), requires_grad=False).squeeze()
-            x_v = Variable(x[1].float().type(DTYPE), requires_grad=False).squeeze()
-            x_t = Variable(x[2].float().type(DTYPE), requires_grad=False)
-            y = Variable(batch[-1].view(-1, 1).float().type(DTYPE), requires_grad=False)
-            output = model(x_a, x_v, x_t)
+            t, v, a, y = batch
+            output_valid = model(a, v, t)
             valid_loss = criterion(output, y)
         output_valid = output.cpu().data.numpy().reshape(-1)
         y = y.cpu().data.numpy().reshape(-1)
@@ -160,12 +141,8 @@ def main(options):
         best_model = torch.load(model_path)
         best_model.eval()
         for batch in test_loader:
-            x = batch[:-1]
-            x_a = Variable(x[0].float().type(DTYPE), requires_grad=False).squeeze()
-            x_v = Variable(x[1].float().type(DTYPE), requires_grad=False).squeeze()
-            x_t = Variable(x[2].float().type(DTYPE), requires_grad=False)
-            y = Variable(batch[-1].view(-1, 1).float().type(DTYPE), requires_grad=False)
-            output_test = best_model(x_a, x_v, x_t)
+            t, v, a, y = batch
+            output_test = model(a, v, t)
             loss_test = criterion(output_test, y)
             test_loss = loss_test.data[0]
         output_test = output_test.cpu().data.numpy().reshape(-1)

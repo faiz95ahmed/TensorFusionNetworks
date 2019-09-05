@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
 from torch.utils.data import DataLoader, Dataset
+from torch.autograd import Variable
 from collections import defaultdict
 
 
@@ -69,16 +70,12 @@ def load(visual_field, acoustic_field, text_field):
 def align(text_field, dataset):
     # we define a simple averaging function that does not depend on intervals
     def avg(intervals: np.array, features: np.array) -> np.array:
-        try:
-            return np.average(features, axis=0)
-        except:
-            return features
+        return np.average(features, axis=0)
 
     # first we align to words with averaging, collapse_function receives a list of functions
     dataset.align(text_field, collapse_functions=[avg])
 
 def annotate(dataset, label_field):
-
     # we add and align to lables to obtain labeled segments
     # this time we don't apply collapse functions so that the temporal sequences are preserved
     label_recipe = {label_field: os.path.join(DATA_PATH, label_field + '.csd')}
@@ -93,19 +90,12 @@ def get_splits(DATASET):
     test_split = DATASET.standard_folds.standard_test_fold
     return train_split, dev_split, test_split
 
-def split(splits, dataset, label_field, visual_field, acoustic_field, text_field):
+def split(splits, dataset, label_field, visual_field, acoustic_field, text_field, batch_size):
     # obtain the train/dev/test splits - these splits are based on video IDs
     train_split, dev_split, test_split = splits
     
     # a sentinel epsilon for safe division, without it we will replace illegal values with a constant
     EPS = 0
-
-    # construct a word2id mapping that automatically takes increment when new words are encountered
-    word2id = defaultdict(lambda: len(word2id))
-    # hence, word2id['<unk>'] == 0
-    UNK = word2id['<unk>']
-    # and, word2id['<pad>'] == 1
-    word2id['<pad>']
 
     # place holders for the final train/dev/test dataset
     train = []
@@ -121,41 +111,27 @@ def split(splits, dataset, label_field, visual_field, acoustic_field, text_field
         # get the video ID and the features out of the aligned dataset
         vid = re.search(pattern, segment).group(1)
         label = dataset[label_field][segment]['features'] #
-        _words = dataset[text_field][segment]['features'] #
-        _visual = dataset[visual_field][segment]['features'] #
-        _acoustic = dataset[acoustic_field][segment]['features'] #
+        words = dataset[text_field][segment]['features'] # GloVe word vectors
+        visual = dataset[visual_field][segment]['features'] #
+        acoustic = dataset[acoustic_field][segment]['features'] #
 
         # if the sequences are not same length after alignment, there must be some problem with some modalities
         # we should drop it or inspect the data again
-        if not _words.shape[0] == _visual.shape[0] == _acoustic.shape[0]:
-            print(f"Encountered datapoint {vid} with text shape {_words.shape}, visual shape {_visual.shape}, acoustic shape {_acoustic.shape}")
+        if not words.shape[0] == visual.shape[0] == acoustic.shape[0]:
+            print(f"Encountered datapoint {vid} with text shape {words.shape}, visual shape {visual.shape}, acoustic shape {acoustic.shape}")
             num_drop += 1
             continue
 
         # remove nan values
         label = np.nan_to_num(label)
-        _visual = np.nan_to_num(_visual)
-        _acoustic = np.nan_to_num(_acoustic)
+        visual = np.nan_to_num(visual)
+        acoustic = np.nan_to_num(acoustic)
 
-        # remove speech pause tokens - this is in general helpful
-        # we should remove speech pauses and corresponding visual/acoustic features together
-        # otherwise modalities would no longer be aligned
-        words = []
-        visual = []
-        acoustic = []
-        for i, word in enumerate(_words):
-            if word[0] != b'sp':
-                words.append(word2id[word[0].decode('utf-8')]) # SDK stores strings as bytes, decode into strings here
-                visual.append(_visual[i, :])
-                acoustic.append(_acoustic[i, :])
+        # should we remove speech pause tokens? if so, would need to add a 4th modality for words (as opposed to word vectors as it is currently)
 
-        words = np.asarray(words) # list to np array
-        visual = np.asarray(visual)
-        acoustic = np.asarray(acoustic)
-
-        # z-normalization per instance and remove nan/infs (Replace NaN with zero and infinity with large finite numbers)
-        visual = np.nan_to_num((visual - visual.mean(0, keepdims=True)) / (EPS + np.std(visual, axis=0, keepdims=True)))
-        acoustic = np.nan_to_num((acoustic - acoustic.mean(0, keepdims=True)) / (EPS + np.std(acoustic, axis=0, keepdims=True)))
+        # take mean for whole segment and remove nan/infs (Replace NaN with zero and infinity with large finite numbers)
+        visual = visual.mean(0)
+        acoustic = acoustic.mean(0)
 
         if vid in train_split:
             train.append(((words, visual, acoustic), label, segment))
@@ -167,14 +143,24 @@ def split(splits, dataset, label_field, visual_field, acoustic_field, text_field
             print(f"Found video that doesn't belong to any splits: {vid}")
 
     print(f"Total number of {num_drop} datapoints have been dropped.")
+    sets = {'train': train, 'dev': dev, 'test': test}
+    for s in ['train', 'dev', 'test']:
+        if len(sets[s]) % batch_size == 1:
+            sets[s] = sets[s][:-1]
+    return sets['train'], sets['dev'], sets['test']
 
-    # turn off the word2id - define a named function here to allow for pickling
-    def return_unk():
-        return UNK
-    word2id.default_factory = return_unk
-    return train, dev, test, word2id
+def get_dims_from_dataset(dataset, text_field, acoustic_field, visual_field):
+    # Getting the dimensions
+    some_id = list(dataset[text_field].keys())[0]
+    _, audio_dim = dataset[acoustic_field][some_id]['features'].shape
+    print("Audio feature dimension is: {}".format(audio_dim))
+    _, visual_dim = dataset[visual_field][some_id]['features'].shape
+    print("Visual feature dimension is: {}".format(visual_dim))
+    _, text_dim = dataset[text_field][some_id]['features'].shape
+    print("Text feature dimension is: {}".format(text_dim))
+    return (audio_dim, visual_dim, text_dim)
 
-def create_data_loader(train, dev, test, word2id):
+def create_data_loader(train, dev, test, batch_sz, DTYPE):
     def multi_collate(batch):
         '''
         Collate functions assume batch = [Dataset[i] for i in index_set]
@@ -183,17 +169,48 @@ def create_data_loader(train, dev, test, word2id):
         batch = sorted(batch, key=lambda x: x[0][0].shape[0], reverse=True)
         
         # get the data out of the batch - use pad sequence util functions from PyTorch to pad things
-        labels = torch.cat([torch.from_numpy(sample[1]) for sample in batch], dim=0)
-        sentences = pad_sequence([torch.LongTensor(sample[0][0]) for sample in batch], padding_value=word2id['<pad>'])
-        visual = pad_sequence([torch.FloatTensor(sample[0][1]) for sample in batch])
-        acoustic = pad_sequence([torch.FloatTensor(sample[0][2]) for sample in batch])
-        
-        # lengths are useful later in using RNNs
-        lengths = torch.LongTensor([sample[0][0].shape[0] for sample in batch])
-        return sentences, visual, acoustic, labels, lengths
+        _y = torch.cat([torch.from_numpy(sample[1]) for sample in batch], dim=0)
+        _t = pad_sequence([torch.LongTensor(sample[0][0]) for sample in batch], padding_value=0)
+        _v = pad_sequence([torch.FloatTensor(sample[0][1]) for sample in batch])
+        _a = pad_sequence([torch.FloatTensor(sample[0][2]) for sample in batch])
+
+        # convert to the right datatype (for CUDA)
+        _a2 = Variable(_a.float().type(DTYPE), requires_grad=False).squeeze()
+        _v2 = Variable(_v.float().type(DTYPE), requires_grad=False).squeeze()
+        _t2 = Variable(_t.float().type(DTYPE), requires_grad=False)
+        y = Variable(_y.view(-1, 1).float().type(DTYPE), requires_grad=False)
+
+        a, v, t = check_dimensions_and_transpose(_a2, _v2, _t2)
+
+        return t, v, a, y
+
     # construct dataloaders, dev and test could use around ~X3 times batch size since no_grad is used during eval
-    batch_sz = 56
     train_loader = DataLoader(train, shuffle=True, batch_size=batch_sz, collate_fn=multi_collate)
     dev_loader = DataLoader(dev, shuffle=False, batch_size=batch_sz*3, collate_fn=multi_collate)
     test_loader = DataLoader(test, shuffle=False, batch_size=batch_sz*3, collate_fn=multi_collate)
     return train_loader, dev_loader, test_loader
+
+def check_dimensions_and_transpose(_a, _v, _t):
+    if len(_a.shape) != 2:
+        # batch size of 1
+        audio_dim = _a.shape[0]
+        a = _a.view(1, audio_dim)
+    else:
+        a = _a.transpose(0, 1)
+
+    if len(_v.shape) != 2:
+        # batch size of 1
+        visual_dim = _v.shape[0]
+        v = _v.view(1, visual_dim)
+    else:
+        v = _v.transpose(0, 1)
+
+    if len(_t.shape) != 3:
+        # batch size of 1
+        seq_length = _t.shape[0]
+        text_dim = _t.shape[1]
+        t = _t.view(1, seq_length, text_dim)
+    else:
+        t = _t.transpose(0, 1)
+
+    return a, v, t
