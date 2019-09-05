@@ -44,6 +44,8 @@ def preprocess(options):
         utils.align(text_field, dataset)
         utils.annotate(dataset, label_field)
         splits = utils.get_splits(DATASET)
+        if not os.path.exists('./vars'):
+            os.makedirs('./vars')
         f = open('./vars/dump', 'wb+')
         pickle.dump([splits, dataset], f)
         f.close()
@@ -110,23 +112,23 @@ def main(options):
         for batch in valid_loader:
             t, v, a, y = batch
             output_valid = model(a, v, t)
-            valid_loss = criterion(output, y)
+            valid_loss = criterion(output_valid, y)
         output_valid = output.cpu().data.numpy().reshape(-1)
         y = y.cpu().data.numpy().reshape(-1)
 
-        if np.isnan(valid_loss.data[0]):
+        if np.isnan(valid_loss.data.item()):
             print("Training got into NaN values...\n\n")
             complete = False
             break
 
         valid_binacc = accuracy_score(output_valid>=0, y>=0)
 
-        print("Validation loss is: {}".format(valid_loss.data[0] / len(valid_loader.dataset)))
+        print("Validation loss is: {}".format(valid_loss.data.item() / len(valid_loader.dataset)))
         print("Validation binary accuracy is: {}".format(valid_binacc))
 
-        if (valid_loss.data[0] < min_valid_loss):
+        if (valid_loss.data.item() < min_valid_loss):
             curr_patience = patience
-            min_valid_loss = valid_loss.data[0]
+            min_valid_loss = valid_loss.data.item()
             torch.save(model, model_path)
             print("Found new best model, saving to disk...")
         else:
@@ -144,7 +146,7 @@ def main(options):
             t, v, a, y = batch
             output_test = model(a, v, t)
             loss_test = criterion(output_test, y)
-            test_loss = loss_test.data[0]
+            test_loss = loss_test.data.item()
         output_test = output_test.cpu().data.numpy().reshape(-1)
         y = y.cpu().data.numpy().reshape(-1)
 

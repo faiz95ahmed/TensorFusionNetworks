@@ -26,10 +26,10 @@ MANIFEST
 .vscode/
 
 # downloaded datasets
-/data/
+/data/**
 
 # cached data
-/vars/
+/vars/**
 
 # trained models
 *.std

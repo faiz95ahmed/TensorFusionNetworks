@@ -73,6 +73,7 @@ def align(text_field, dataset):
         return np.average(features, axis=0)
 
     # first we align to words with averaging, collapse_function receives a list of functions
+    # here the data is aligned at the word level
     dataset.align(text_field, collapse_functions=[avg])
 
 def annotate(dataset, label_field):
@@ -93,9 +94,6 @@ def get_splits(DATASET):
 def split(splits, dataset, label_field, visual_field, acoustic_field, text_field, batch_size):
     # obtain the train/dev/test splits - these splits are based on video IDs
     train_split, dev_split, test_split = splits
-    
-    # a sentinel epsilon for safe division, without it we will replace illegal values with a constant
-    EPS = 0
 
     # place holders for the final train/dev/test dataset
     train = []
@@ -129,7 +127,7 @@ def split(splits, dataset, label_field, visual_field, acoustic_field, text_field
 
         # should we remove speech pause tokens? if so, would need to add a 4th modality for words (as opposed to word vectors as it is currently)
 
-        # take mean for whole segment and remove nan/infs (Replace NaN with zero and infinity with large finite numbers)
+        # take mean for whole utterance
         visual = visual.mean(0)
         acoustic = acoustic.mean(0)
 
@@ -143,10 +141,13 @@ def split(splits, dataset, label_field, visual_field, acoustic_field, text_field
             print(f"Found video that doesn't belong to any splits: {vid}")
 
     print(f"Total number of {num_drop} datapoints have been dropped.")
+
+    # have to remove data so that no batches consist of just 1 datapoint
     sets = {'train': train, 'dev': dev, 'test': test}
     for s in ['train', 'dev', 'test']:
         if len(sets[s]) % batch_size == 1:
             sets[s] = sets[s][:-1]
+
     return sets['train'], sets['dev'], sets['test']
 
 def get_dims_from_dataset(dataset, text_field, acoustic_field, visual_field):
@@ -165,6 +166,30 @@ def create_data_loader(train, dev, test, batch_sz, DTYPE):
         '''
         Collate functions assume batch = [Dataset[i] for i in index_set]
         '''
+        def check_dimensions_and_transpose(_a, _v, _t):
+            if len(_a.shape) != 2:
+                # batch size of 1
+                audio_dim = _a.shape[0]
+                a = _a.view(1, audio_dim)
+            else:
+                a = _a.transpose(0, 1)
+
+            if len(_v.shape) != 2:
+                # batch size of 1
+                visual_dim = _v.shape[0]
+                v = _v.view(1, visual_dim)
+            else:
+                v = _v.transpose(0, 1)
+
+            if len(_t.shape) != 3:
+                # batch size of 1
+                seq_length = _t.shape[0]
+                text_dim = _t.shape[1]
+                t = _t.view(1, seq_length, text_dim)
+            else:
+                t = _t.transpose(0, 1)
+
+            return a, v, t
         # for later use we sort the batch in descending order of length
         batch = sorted(batch, key=lambda x: x[0][0].shape[0], reverse=True)
         
@@ -190,27 +215,3 @@ def create_data_loader(train, dev, test, batch_sz, DTYPE):
     test_loader = DataLoader(test, shuffle=False, batch_size=batch_sz*3, collate_fn=multi_collate)
     return train_loader, dev_loader, test_loader
 
-def check_dimensions_and_transpose(_a, _v, _t):
-    if len(_a.shape) != 2:
-        # batch size of 1
-        audio_dim = _a.shape[0]
-        a = _a.view(1, audio_dim)
-    else:
-        a = _a.transpose(0, 1)
-
-    if len(_v.shape) != 2:
-        # batch size of 1
-        visual_dim = _v.shape[0]
-        v = _v.view(1, visual_dim)
-    else:
-        v = _v.transpose(0, 1)
-
-    if len(_t.shape) != 3:
-        # batch size of 1
-        seq_length = _t.shape[0]
-        text_dim = _t.shape[1]
-        t = _t.view(1, seq_length, text_dim)
-    else:
-        t = _t.transpose(0, 1)
-
-    return a, v, t
